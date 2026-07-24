@@ -27,3 +27,4 @@ Even after going through the war and not being able to be present at "SteamX Rob
 6. Testing The Robot
     From the beginning of the report and you've been hearing about how perfect the robot is and all this pefection is because we learned from our mistakes during the first test drive which was a catastrophy, the mistakes which ruined the robot weren't only fixed but perfected down to the last detail, and while fixing these flaws many more test drives were taken in between to make sure everything was 100% fixed. A test drive was done around 20 mins ago to test the robots abilities and it showed great results, round one's code will be provided asa seperate file on this repo
    
+Note: the youtube link is going to be here at ( https://youtu.be/2A922G6HmCQ?si=gGtHmeCh49PscHyi )
