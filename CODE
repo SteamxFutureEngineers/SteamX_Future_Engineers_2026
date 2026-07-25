@@ -1,0 +1,1084 @@
+/*
+ * WRO Future Engineers 2026 - OPEN CHALLENGE (no traffic signs)
+ * Board: Arduino Mega 2560
+ * Gyro:  HW-290 module (MPU6050 on I2C: SDA=20, SCL=21 on Mega)
+ * Steering: hobby SERVO on pin 4 (replaces the old DC-motor steering)
+ *
+ * Hardware (matches your pin list):
+ *   Steering servo:    signal pin 4
+ *   Driving motor:     IN3(32), IN4(33), power ENB(3)
+ *   Front ultrasonic:  trig 38, echo 39
+ *   Right ultrasonic:  trig 40, echo 41
+ *   Left  ultrasonic:  trig 42, echo 43
+ *   Start button:      pin 5 -> GND (uses INPUT_PULLUP)  [required by rules 9.10/9.11]
+ *
+ *   NOTE: the servo needs its own 5-6V supply (from your regulator/BEC),
+ *   not the Arduino 5V pin, and share GND with the Arduino. IN1/IN2/ENA
+ *   are no longer used since the DC steering motor and L298N channel A
+ *   were replaced by the servo.
+ *
+ * Logic:
+ *   1. Wait for start button.
+ *   2. Drive straight for 1s (gyro holds heading), then keep driving straight.
+ *      Steering = gyro heading hold + gentle wall centering from the side
+ *      sensors + a slow auto-trim that learns the car's steering bias.
+ *   3. Corner detection: the WRO corridor is never wider than ~100cm, so a
+ *      side sensor reading past SIDE_OPEN_CM (130cm) can ONLY mean the inner
+ *      wall ended = corner opened on that side. Turn toward it. Must hold for
+ *      2 consecutive reads (rejects one-off bad echoes). The first corner
+ *      also fixes the driving direction for the whole run.
+ *   4. Each corner: target heading changes by 90 deg, gyro turns us there.
+ *      Before the next corner can count, the watched side must first read
+ *      CLOSED again (re-arm) and a time cooldown must pass.
+ *   5. Front wall < 70cm is the second corner cue (narrow sections open the
+ *      side very late). At the FIRST corner with no side open, turn toward
+ *      the CLOSER side - the ring always bends toward its center.
+ *   6. If TURNING makes no progress for 2.5s (nose pinned on a wall), back
+ *      up briefly and resume the turn.
+ *   7. Count corners. 12 corners = 3 laps. Then drive into the start section
+ *      until the far wall reads FINISH_FRONT_CM (mid-section) and stop
+ *      (rule 9.24.2: must stop autonomously).
+ *
+ * Debugging: telemetry is recorded to EEPROM during every run and replayed
+ * as CSV over serial at boot (see EEPROM FLIGHT RECORDER below).
+ */
+
+#include <Wire.h>
+#include <Servo.h>
+#include <EEPROM.h>
+
+// ================= DRIVING MOTOR PINS =================
+#define IN3 6
+#define IN4 4
+#define ENB 3    // driving power (PWM)
+
+// ================= STEERING SERVO =================
+#define SERVO_PIN 2
+Servo steeringServo;
+
+// ================= ULTRASONICS =================
+#define RIGHT_TRIG 36
+#define RIGHT_ECHO 37
+#define LEFT_TRIG 39
+#define LEFT_ECHO 38
+#define FRONT_TRIG  40
+#define FRONT_ECHO  41
+
+// ================= START BUTTON =================
+#define START_BUTTON 53        // moved off pin 4 (now used by the servo)
+
+// ================= MPU6050 (HW-290) =================
+#define MPU_ADDR 0x68
+
+// Sign of the gyro Z axis so that CCW rotation = positive yaw (depends on how
+// the module is mounted; flipping the board upside-down inverts it).
+// VALIDATED on this car: +1 gives right turn -> negative yaw, as required.
+// Re-test after remounting the module: rotate the car CCW by hand and check
+// that the logged yaw increases; if it decreases, flip this to -1.
+#define GYRO_Z_SIGN (1)
+
+// ================= TESTING =================
+#define TESTING_MODE  1    // 1 = skip start button (bench testing only!)
+                            // 0 = normal competition behavior
+
+// DEBUG: 1 = ping the ultrasonics in EVERY state, every loop, so the log
+// always shows live readings (bench debugging - wave your hand in front of
+// a sensor and the numbers must move).
+// SET TO 0 FOR REAL DRIVING: a full 3-sensor read blocks ~100-200ms, which
+// would delay TURNING's corner-detection handoff (steering itself stays
+// alive via gyroSteerFor between pings).
+#define DEBUG_ALWAYS_READ_US 0
+
+// ================= OBSTACLE CHALLENGE (Round 2) =================
+// 1 = detect red/green blocks with the HuskyLens and steer around them.
+// 0 = plain laps, identical to Round 1 (HuskyLens ignored, library not needed).
+#define OBSTACLE_MODE 1
+
+#if OBSTACLE_MODE
+#include "HUSKYLENS.h"        // install "HUSKYLENS" via Arduino Library Manager
+HUSKYLENS huskylens;          // hardware Serial2: HuskyLens T->pin17(RX2), R->pin16(TX2)
+
+// HuskyLens must be in COLOR RECOGNITION mode with red and green LEARNED. Each
+// learned color gets an ID in the order you learn them - set these to match.
+const int HUSKY_ID_RED   = 1;
+const int HUSKY_ID_GREEN = 2;
+
+// PASS RULE (WRO). Default: RED block -> keep it on the car's LEFT (car passes
+// on its right); GREEN -> keep it on the car's RIGHT. If the bench test shows
+// the car dodging the WRONG way, set this to 0 to swap red<->green.
+#define RED_KEEPS_LEFT 1
+
+// HuskyLens frame is 320px wide (x: 0=left .. 320=right, center=160). We steer
+// so the block's image slides to the far edge = the block ends up beside us on
+// the side the rule wants. Driving the image toward an edge is a stable P loop.
+const int   BLOCK_X_LEFT     = 50;   // where a "keep on our left" block should sit in frame (nearer the
+                                     // edge = car commits further to the side = more clearance)
+const int   BLOCK_X_RIGHT    = 270;  // where a "keep on our right" block should sit in frame
+const int   BLOCK_MIN_SIZE   = 70;   // block width(px) must exceed this to act. Lower = react from farther
+                                     // away = more room to move over gently (was 25 = reacted late)
+const float BLOCK_GAIN       = 0.12; // heading-offset deg per px of image error
+const float BLOCK_MAX_OFFSET = 30.0; // max heading bend for avoidance (deg) - wider than wall centering
+const float BLOCK_MIN_OFFSET = 15.0;  // deg - never ease below this while a block is still active
+
+// most-relevant (closest) block seen this loop; blockColorId 0 = none
+int  blockColorId = 0;      // HUSKY_ID_RED / HUSKY_ID_GREEN / 0
+int  blockX = 160, blockSize = 0;
+bool blockActive = false;   // a close-enough block is currently steering us
+
+// When a block gets close it slides out of the camera frame, so blockActive
+// drops even though the block is still right beside us. Keep applying the last
+// dodge for BLOCK_HOLD_MS after that, so we finish clearing it instead of
+// snapping back to center and clipping it (flight log: "turns beside the block
+// then turns straight back to center").
+const unsigned long BLOCK_HOLD_MS   = 1500;  // how long to keep holding the dodge line after losing sight of the block
+const unsigned long BLOCK_RETURN_MS = 2000;   // how long to smoothly ease back to center after that
+float lastBlockOffset = 0;
+unsigned long lastBlockMs = 0;
+#endif
+
+// ================= TUNABLE SETTINGS =================
+  // 0-255 driving PWM
+
+// --- servo steering calibration: MEASURE THESE ON YOUR OWN CAR ---
+// These three are the single source of truth for steering direction: the code
+// derives which numeric way to move from them. VERIFY: servo.write(SERVO_LEFT)
+// must physically point the wheels LEFT - if it points them right, swap the
+// two values (don't touch the control code).
+const int SERVO_CENTER = 90;   // angle where wheels point straight
+const int SERVO_LEFT   = 55;   // full-left angle  (tune: max steer without binding)
+const int SERVO_RIGHT  = 125;  // full-right angle (tune: max steer without binding)
+const float SERVO_KP   = 1.2;  // servo degrees per degree of heading error
+
+const float GYRO_RATE_DEADBAND = 0.4; // deg/s: gyro rates below this are treated as 0 (residual bias noise, not real rotation)
+const float TURN_DONE_ERROR  = 8.0;  // deg: heading error below this = turn finished
+const int   FRONT_CORNER_CM = 70;     // front wall closer than this = corner. This is the RELIABLE cue in
+                                      // narrow sections: the side sensor passes the inner-wall end very late
+                                      // there, so waiting for the side to open can mean nose-in-wall first
+const int   SIDE_OPEN_CM = 130;       // CORNER TRIGGER (absolute): the corridor is never wider than ~100cm on
+                                      // this map, so a side reading past this can only be the corner opening
+const int   CORNER_CONFIRM_READS = 2; // a trigger must hold this many loops in a row (one angled-wall no-echo
+                                      // returns 999 = "open" - a single bad read must not start a turn)
+const unsigned long TURN_TIMEOUT_MS = 2500; // TURNING longer than this = nose pinned against a wall
+const unsigned long TURN_REVERSE_MS = 900;  // back up this long to free the nose, then keep turning
+
+// --- wall centering: heading hold alone controls ANGLE, not lateral position.
+// A few degrees of heading bias slides the car sideways into a wall over one
+// straight (flight log: R went 39->21 before corner 1, then exited the turn
+// scraping at R=4). These nudge the TARGET HEADING a little toward the middle.
+const float WALL_CENTER_GAIN  = 0.25; // deg of heading offset per cm of (left-right) imbalance
+const float MAX_CENTER_OFFSET = 10.0; // never bend the heading more than this (deg)
+const int   WALL_NEAR_CM      = 100;  // side reading below this = a wall is really beside us
+const int   WALL_PUSH_CM      = 20;   // closer than this to a single wall = actively push away
+const unsigned long CORNER_COOLDOWN_MS = 1500; // after a turn, ignore side-open triggers this long
+                                      // (the side often still reads open right after turning)
+const int   TOTAL_CORNERS    = 12;   // 3 laps x 4 corners
+const int   FINISH_FRONT_CM  = 140;  // FINISH: stop when the section's far wall reads this close =
+                                     // parked mid-section (distance-based, so battery level can't shift it)
+const unsigned long FINISH_TIMEOUT_MS = 5000; // FINISH backstop: stop after this long no matter what
+const unsigned long STRAIGHT_START_MS = 1000; // drive straight this long after start, ignoring corners
+
+// ================= STATE MACHINE =================
+enum State { WAIT_START, STRAIGHT_START, FIND_DIRECTION, RUN, TURNING, FINISH, DONE };
+State state = WAIT_START;
+
+// human-readable state names for the serial log (same order as enum State)
+const char *STATE_NAMES[] = { "WAIT_START", "STRAIGHT", "FIND_DIR", "RUN", "TURNING", "FINISH", "DONE" };
+
+unsigned long straightStartMs = 0;   // when STRAIGHT_START began
+
+int  turnDirection = 0;      // +1 = counter-clockwise (left turns), -1 = clockwise (right turns)
+int  cornerCount   = 0;
+unsigned long lastTurnDoneMs = 0;  // when the last turn finished (for the corner cooldown)
+int  sideOpenStreak   = 0;   // consecutive loops the corner-side has read open (see CORNER_CONFIRM_READS)
+int  frontCloseStreak = 0;   // consecutive loops the front has read closer than FRONT_CORNER_CM
+int  seenOpenDir      = 0;   // FIND_DIRECTION: which side has EVER read open on approach (+1 left / -1 right)
+bool sideRearmed      = false; // RUN: the watched side must read CLOSED once after each turn before it may
+                               // trigger again (exiting a turn still inside the corner zone leaves the side
+                               // open for seconds - time cooldown alone can expire and double-count a corner)
+unsigned long turnStartMs    = 0;  // when the current TURNING started (stuck detection)
+unsigned long reverseUntilMs = 0;  // while millis() < this, TURNING is backing up to free the nose
+
+// last ultrasonic readings - only refreshed in states that actually use them
+// (a fresh 3-sensor pass blocks ~100-200ms; TURNING skips it so the turn
+// hands off to RUN without delay)
+long lastFront = 999, lastRight = 999, lastLeft = 999;
+
+// current wall-centering offset (deg), recomputed each loop from the side
+// sensors and applied by the fast steering loop; 0 while turning
+float centerOffset = 0.0;
+
+// --- steering auto-trim: every run starts with the same rightward drift, so
+// wheels commanded to SERVO_CENTER don't actually roll straight (mis-centered
+// servo horn / motor pull). A pure P controller then holds a PERMANENT heading
+// error to cancel that bias (flight logs: yaw settles at -10..-15 deg, never
+// 0). This slow integral learns the bias during the run so the heading error
+// can return to 0. The learned value is shown as "trim" in the steer log -
+// once you see where it stabilizes, bake it into SERVO_CENTER for good.
+const float TRIM_RATE  = 0.4;   // steer-deg gained per deg of heading error per second
+const float TRIM_LIMIT = 15.0;  // max trim magnitude (steer-deg)
+float servoTrim = 0.0;
+
+// ================= GYRO VARIABLES =================
+float yaw        = 0.0;      // integrated heading, deg. CCW positive.
+float targetYaw  = 0.0;      // heading we want to hold
+float gyroBiasZ  = 0.0;      // measured at startup (vehicle must be still!)
+unsigned long lastGyroMicros = 0;
+
+// =====================================================
+//              EEPROM FLIGHT RECORDER
+// =====================================================
+// Logs telemetry into the Mega's 4KB EEPROM during the run (EEPROM survives
+// power-off and reset), so a real untethered run can be debugged afterwards:
+// plug in USB, open the serial monitor, and the whole last run prints as CSV
+// at boot. One record = 13 bytes -> 314 records; at one per 300ms ~= 90 s
+// (plenty for a block-encounter test; raise LOG_PERIOD_MS for a full 3-lap run).
+// Every record includes the 5V rail voltage, and an unexpected reset mid-run
+// (brown-out!) appends a BOOT marker with the hardware reset cause - together
+// these prove/disprove battery problems.
+// Layout: [0]=magic  [1..2]=record count  [3]=run-active flag  [4...]=records
+// Record: [0..1]=t(0.1s)  [2]=state  [3]=F  [4]=R  [5]=L  [6..7]=yaw(0.1deg)
+//         [8]=Vcc(0.05V)  [9]=blk(0/1R/2G)  [10]=blockX/2  [11]=blockSize  [12]=steerOffset(int8 deg)
+#define LOG_MAGIC      0xA6      // bump this whenever the record format changes - it auto-invalidates
+                                 // any older-format log still in EEPROM so a stale dump can't misread
+#define LOG_ACTIVE_ADDR 3        // 1 = a run is in progress (cleared when FINISH completes)
+#define LOG_DATA_ADDR  4
+#define LOG_REC_SIZE   13
+#define LOG_MAX_RECS   ((4096 - LOG_DATA_ADDR) / LOG_REC_SIZE)   // 314
+#define LOG_PERIOD_MS  300
+#define LOG_BOOT_STATE 99        // state value marking "the board rebooted here"
+
+uint16_t logCount = 0;           // records written this run
+unsigned long logT0 = 0;         // millis() at GO (timestamps are relative to it)
+
+// Vcc (the 5V rail) measured against the internal 1.1V bandgap - no wiring
+// needed. A brown-out shows as this sagging right before the log cuts off.
+long readVccMillivolts() {
+  ADMUX = _BV(REFS0) | 0x1E;     // AVcc reference, input = 1.1V bandgap
+  delay(2);                      // let the reference settle
+  ADCSRA |= _BV(ADSC);
+  while (ADCSRA & _BV(ADSC));
+  return 1125300L / ADC;         // 1.1V * 1023 * 1000 / reading
+}
+
+uint8_t packVcc() { return (uint8_t)constrain(readVccMillivolts() / 50, 0, 255); }  // 0.05V units
+
+void logClear() {
+  logCount = 0;
+  logT0 = millis();
+  EEPROM.update(0, LOG_MAGIC);
+  EEPROM.put(1, logCount);
+}
+
+// Called at GO. If the previous run never finished (flag still set = the
+// board reset mid-run), KEEP that log and append to it, so the evidence and
+// the BOOT marker survive a TESTING_MODE auto-restart instead of being wiped.
+void logStartRun() {
+  if (EEPROM.read(0) == LOG_MAGIC && EEPROM.read(LOG_ACTIVE_ADDR) == 1) {
+    EEPROM.get(1, logCount);
+    if (logCount > LOG_MAX_RECS) logCount = LOG_MAX_RECS;
+    logT0 = millis();
+    Serial.println(F("Previous run never finished - continuing its flight log"));
+  } else {
+    logClear();
+  }
+  EEPROM.update(LOG_ACTIVE_ADDR, 1);
+}
+
+void logRunFinished() { EEPROM.update(LOG_ACTIVE_ADDR, 0); }
+
+// pack a distance into one byte: 0..250cm, 255 = "no reading / >250"
+uint8_t packCm(long d) { return (d >= 250) ? 255 : (uint8_t)d; }
+
+void logTelemetry() {
+  static unsigned long lastLogMs = 0;
+  unsigned long now = millis();
+  if (now - lastLogMs < LOG_PERIOD_MS) return;
+  if (logCount >= LOG_MAX_RECS) return;         // full: keep the run's beginning
+  lastLogMs = now;
+
+  int addr = LOG_DATA_ADDR + (int)logCount * LOG_REC_SIZE;
+  uint16_t t10   = (now - logT0) / 100;         // time since GO, 0.1s steps
+  int16_t  yaw10 = (int16_t)(yaw * 10.0);       // yaw in 0.1 deg steps
+  EEPROM.put(addr, t10);
+  EEPROM.update(addr + 2, (uint8_t)state);
+  EEPROM.update(addr + 3, packCm(lastFront));
+  EEPROM.update(addr + 4, packCm(lastRight));
+  EEPROM.update(addr + 5, packCm(lastLeft));
+  EEPROM.put(addr + 6, yaw10);
+  EEPROM.update(addr + 8, packVcc());
+  uint8_t blk = 0;                       // 0 none / 1 red / 2 green
+  uint8_t bx = 0, bsz = 0;
+#if OBSTACLE_MODE
+  if (blockActive) {
+    blk = (blockColorId == HUSKY_ID_RED) ? 1 : 2;
+    bx  = (uint8_t)constrain(blockX / 2, 0, 255);   // frame x/2 (0..160)
+    bsz = (uint8_t)constrain(blockSize, 0, 255);
+  }
+#endif
+  EEPROM.update(addr + 9,  blk);
+  EEPROM.update(addr + 10, bx);
+  EEPROM.update(addr + 11, bsz);
+  EEPROM.update(addr + 12, (int8_t)constrain((int)lround(centerOffset), -127, 127));  // steer offset applied (deg)
+
+  logCount++;
+  EEPROM.put(1, logCount);   // header updated per record so a power cut mid-run loses nothing
+}
+
+// Appended at boot when the previous run never finished: marks WHERE in the
+// log the board rebooted and stores the hardware reset cause + Vcc at boot.
+void logBootMarker(uint8_t resetFlags) {
+  if (EEPROM.read(0) != LOG_MAGIC || EEPROM.read(LOG_ACTIVE_ADDR) != 1) return;
+  uint16_t n; EEPROM.get(1, n);
+  if (n >= LOG_MAX_RECS) return;
+  int addr = LOG_DATA_ADDR + (int)n * LOG_REC_SIZE;
+  uint16_t z16 = 0; int16_t zy = 0;
+  EEPROM.put(addr, z16);
+  EEPROM.update(addr + 2, LOG_BOOT_STATE);
+  EEPROM.update(addr + 3, resetFlags);          // MCUSR bits at this boot
+  EEPROM.update(addr + 4, 0);
+  EEPROM.update(addr + 5, 0);
+  EEPROM.put(addr + 6, zy);
+  EEPROM.update(addr + 8, packVcc());
+  EEPROM.update(addr + 9, 0);
+  n++; EEPROM.put(1, n);
+}
+
+void printResetCause(uint8_t f) {
+  if (f & _BV(BORF))  Serial.print(F("BROWN-OUT "));
+  if (f & _BV(WDRF))  Serial.print(F("WATCHDOG "));
+  if (f & _BV(EXTRF)) Serial.print(F("EXTERNAL-RESET "));
+  if (f & _BV(PORF))  Serial.print(F("POWER-ON "));
+  if (f == 0)         Serial.print(F("UNKNOWN (bootloader cleared MCUSR - judge by the Vcc column)"));
+}
+
+void logDump() {
+  if (EEPROM.read(0) != LOG_MAGIC) { Serial.println(F("No run log in EEPROM.")); return; }
+  uint16_t n; EEPROM.get(1, n);
+  if (n > LOG_MAX_RECS) n = LOG_MAX_RECS;
+  Serial.print(F("=== LAST RUN LOG (")); Serial.print(n); Serial.println(F(" records) ==="));
+  Serial.println(F("t_s,state,front,right,left,yaw,vcc,blk,blkX,blkSz,steer"));
+  for (uint16_t i = 0; i < n; i++) {
+    int addr = LOG_DATA_ADDR + (int)i * LOG_REC_SIZE;
+    uint16_t t10; int16_t yaw10;
+    EEPROM.get(addr, t10);
+    uint8_t st  = EEPROM.read(addr + 2);
+    uint8_t f   = EEPROM.read(addr + 3);
+    uint8_t r   = EEPROM.read(addr + 4);
+    uint8_t l   = EEPROM.read(addr + 5);
+    EEPROM.get(addr + 6, yaw10);
+    uint8_t vcc = EEPROM.read(addr + 8);
+    uint8_t blk = EEPROM.read(addr + 9);
+    uint8_t bx  = EEPROM.read(addr + 10);
+    uint8_t bsz = EEPROM.read(addr + 11);
+    int8_t  soff = (int8_t)EEPROM.read(addr + 12);
+
+    if (st == LOG_BOOT_STATE) {
+      // the board rebooted here mid-run - f holds the MCUSR reset flags
+      Serial.print(F("--- BOOT, cause: ")); printResetCause(f);
+      Serial.print(F("  Vcc at boot: ")); Serial.print(vcc * 0.05, 2);
+      Serial.println(F("V ---"));
+      continue;
+    }
+    Serial.print(t10 / 10.0, 1);                       Serial.print(',');
+    Serial.print(st < 7 ? STATE_NAMES[st] : "?");      Serial.print(',');
+    Serial.print(f); Serial.print(',');
+    Serial.print(r); Serial.print(',');
+    Serial.print(l); Serial.print(',');
+    Serial.print(yaw10 / 10.0, 1);                     Serial.print(',');
+    Serial.print(vcc * 0.05, 2);                       Serial.print(',');
+    Serial.print(blk == 1 ? F("R") : blk == 2 ? F("G") : F("-")); Serial.print(',');
+    Serial.print(blk ? bx * 2 : 0);                    Serial.print(',');   // blockX (undo /2)
+    Serial.print(bsz);                                 Serial.print(',');
+    Serial.println(soff);                                                   // steer offset applied (deg)
+  }
+  Serial.println(F("=== END LOG ==="));
+}
+
+// =====================================================
+//                     GYRO (MPU6050)
+// =====================================================
+void mpuWrite(byte reg, byte val) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg);
+  Wire.write(val);
+  Wire.endTransmission();
+}
+
+int16_t readGyroZraw() {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x47);                       // GYRO_ZOUT_H
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU_ADDR, 2);
+  int16_t hi = Wire.read();
+  int16_t lo = Wire.read();
+  return (hi << 8) | lo;
+}
+
+// ---- bias calibration: vehicle MUST be completely still ----
+// Runs 5 separate passes and takes the median of them instead of one long
+// average, so a bump/vibration during a single pass can't skew the result.
+#define GYRO_CAL_PASSES 5
+#define GYRO_CAL_SAMPLES_PER_PASS 200   // 5 x 200 = 1000 total samples, same as before
+
+void gyroInit() {
+  Wire.begin();
+  mpuWrite(0x6B, 0x00);                   // wake up
+  mpuWrite(0x1B, 0x08);                   // gyro full scale +/-500 dps
+  delay(100);
+
+  float passBias[GYRO_CAL_PASSES];
+  for (int pass = 0; pass < GYRO_CAL_PASSES; pass++) {
+    long sum = 0;
+    for (int i = 0; i < GYRO_CAL_SAMPLES_PER_PASS; i++) {
+      sum += readGyroZraw();
+      delay(2);
+    }
+    passBias[pass] = (float)sum / GYRO_CAL_SAMPLES_PER_PASS;
+    Serial.print(F("  gyro cal pass ")); Serial.print(pass + 1);
+    Serial.print(F("/")); Serial.print(GYRO_CAL_PASSES);
+    Serial.print(F(": bias = ")); Serial.println(passBias[pass], 2);
+  }
+
+  for (int i = 1; i < GYRO_CAL_PASSES; i++) {  // insertion sort, tiny array
+    float key = passBias[i];
+    int j = i - 1;
+    while (j >= 0 && passBias[j] > key) { passBias[j + 1] = passBias[j]; j--; }
+    passBias[j + 1] = key;
+  }
+  gyroBiasZ = passBias[GYRO_CAL_PASSES / 2];   // median
+  Serial.print(F("Gyro bias (median): ")); Serial.println(gyroBiasZ, 2);
+
+  lastGyroMicros = micros();
+}
+
+void updateYaw() {
+  unsigned long now = micros();
+  float dt = (now - lastGyroMicros) / 1000000.0;
+  lastGyroMicros = now;
+
+  // +/-500 dps range -> 65.5 LSB per deg/s
+  float rate = GYRO_Z_SIGN * (readGyroZraw() - gyroBiasZ) / 65.5;
+
+  // the calibrated bias is never exactly right (and drifts with temperature),
+  // so tiny residual noise gets integrated as fake rotation even while going
+  // straight - ignore anything below this rate, it isn't a real turn
+  if (fabs(rate) < GYRO_RATE_DEADBAND) rate = 0;
+
+  yaw += rate * dt;                       // CCW rotation gives positive yaw
+}
+
+// =====================================================
+//                     ULTRASONIC
+// =====================================================
+// One raw ping. Returns -1 for any invalid reading (no echo, or a 0 cm glitch
+// below the sensor's real minimum range) so the caller can decide what it means.
+long pingOnce(int trigPin, int echoPin) {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  long duration = pulseIn(echoPin, HIGH, 20000);   // 20 ms timeout (~3.4 m)
+  if (duration == 0) return -1;                    // no echo at all
+
+  long distance = duration * 0.034 / 2;
+  if (distance == 0) return -1;                    // 0 cm glitch
+  return distance;
+}
+
+// Takes several pings and returns their median. Invalid/zero pings are kept
+// as "far" (999) rather than thrown away, because a run of them can be a real
+// reading (e.g. side sensor sees nothing while cornering) - not just noise.
+// With enough samples, a lone spurious ping just gets outvoted by the rest.
+// (3 is enough: median-of-3 kills single glitches, and corner triggers also
+// need 2 consecutive loops - fewer samples = faster loop = better steering)
+#define US_SAMPLES 3
+
+long medianOfSamples(long samples[US_SAMPLES]) {
+  long sorted[US_SAMPLES];
+  for (int i = 0; i < US_SAMPLES; i++) sorted[i] = samples[i];
+
+  for (int i = 1; i < US_SAMPLES; i++) { // insertion sort, n is tiny
+    long key = sorted[i];
+    int j = i - 1;
+    while (j >= 0 && sorted[j] > key) { sorted[j + 1] = sorted[j]; j--; }
+    sorted[j + 1] = key;
+  }
+  return sorted[US_SAMPLES / 2];          // median
+}
+
+// last raw samples per sensor (before the median filter), kept just so we can log them
+long lastFrontRaw[US_SAMPLES], lastRightRaw[US_SAMPLES], lastLeftRaw[US_SAMPLES];
+
+// Keep the gyro heading hold alive for `ms` instead of a dead delay().
+// A full 3-sensor ultrasonic pass blocks 200-450ms; if the servo just sits
+// at the last correction that whole time, the car sweeps far past the target
+// heading between updates and weaves down the corridor (proven by flight
+// log: TURNING, which never pings, was smooth - RUN oscillated +/-80 deg).
+void gyroSteerFor(unsigned long ms) {
+  unsigned long t0 = millis();
+  do {
+    updateYaw();
+    steerToHeading(centerOffset);   // centerOffset = wall centering; 0 in turns
+  } while (millis() - t0 < ms);
+}
+
+// Reads all three ultrasonics in one shot; zero/no-echo readings are already
+// filtered out (kept as 999) rather than dropped. Raw samples are stashed in
+// lastFrontRaw/lastRightRaw/lastLeftRaw for logging.
+void readUltrasonics(long &front, long &right, long &left) {
+  for (int i = 0; i < US_SAMPLES; i++) {
+    long d = pingOnce(FRONT_TRIG, FRONT_ECHO);
+    lastFrontRaw[i] = (d > 0) ? d : 999;
+    gyroSteerFor(10);                    // keep steering between pings, never a dead delay
+  }
+  for (int i = 0; i < US_SAMPLES; i++) {
+    long d = pingOnce(RIGHT_TRIG, RIGHT_ECHO);
+    lastRightRaw[i] = (d > 0) ? d : 999;
+    gyroSteerFor(10);
+  }
+  for (int i = 0; i < US_SAMPLES; i++) {
+    long d = pingOnce(LEFT_TRIG, LEFT_ECHO);
+    lastLeftRaw[i] = (d > 0) ? d : 999;
+    gyroSteerFor(10);
+  }
+
+  front = medianOfSamples(lastFrontRaw);
+  right = medianOfSamples(lastRightRaw);
+  left  = medianOfSamples(lastLeftRaw);
+}
+
+void printOneDistance(long d) {
+  if (d >= 999) Serial.print(F("---- "));
+  else {
+    if (d < 100) Serial.print(' ');
+    if (d < 10)  Serial.print(' ');
+    Serial.print(d);
+    Serial.print(F("cm "));
+  }
+}
+
+void printRawSamples(const char *label, long samples[US_SAMPLES]) {
+  Serial.print(label); Serial.print(F(":["));
+  for (int i = 0; i < US_SAMPLES; i++) {
+    if (i > 0) Serial.print(',');
+    Serial.print(samples[i]);
+  }
+  Serial.print(F("] "));
+}
+
+// Serial-prints current state + ultrasonic + gyro readings, throttled so it
+// doesn't flood the port.
+void printUltrasonics(long front, long right, long left) {
+  static unsigned long lastPrintMs = 0;
+  unsigned long now = millis();
+  if (now - lastPrintMs < 200) return;
+  lastPrintMs = now;
+
+  Serial.print('['); Serial.print(STATE_NAMES[state]); Serial.print(F("] "));
+
+  printRawSamples("F raw", lastFrontRaw);
+  printRawSamples("R raw", lastRightRaw);
+  printRawSamples("L raw", lastLeftRaw);
+
+  Serial.print(F("| US  F: ")); printOneDistance(front);
+  Serial.print(F(" R: "));    printOneDistance(right);
+  Serial.print(F(" L: "));    printOneDistance(left);
+  Serial.print(F(" | Yaw: "));    Serial.print(yaw, 1);
+  Serial.print(F(" Target: "));   Serial.print(targetYaw, 1);
+#if OBSTACLE_MODE
+  Serial.print(F(" | Blk: "));
+  if (blockActive) {
+    Serial.print(blockColorId == HUSKY_ID_RED ? 'R' : 'G');
+    Serial.print(F(" x=")); Serial.print(blockX);
+    Serial.print(F(" sz=")); Serial.print(blockSize);
+  } else Serial.print('-');
+#endif
+  Serial.println();
+}
+
+// =====================================================
+//                     MOVEMENT
+// =====================================================
+void centerSteering() {
+  steeringServo.write(SERVO_CENTER);
+}
+
+// void driveForward() {
+//   analogWrite(ENB, 30);
+//   digitalWrite(IN3, LOW);
+//   digitalWrite(IN4, HIGH);
+// }
+
+unsigned long before = 0;
+const unsigned long wanted = 10;
+
+void driveForward1(int speed) {
+  digitalWrite(ENB, HIGH);
+  digitalWrite(IN3, LOW);
+  analogWrite(IN4, speed);
+}
+void driveForward(){
+  unsigned long now = millis();
+ if (now - before >= wanted) {
+
+    driveForward1(150);
+    
+  }
+  if (now - before >= wanted+10) {
+    // before = now;
+
+    driveForward1(150);
+    
+  }
+}
+
+void driveBackward() {
+  analogWrite(ENB, 50);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+}
+
+void stopDrive() {
+  analogWrite(ENB, 0);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+}
+
+// Prints which way the servo is steering right now and why, throttled so it
+// doesn't flood the port.
+void printSteering(float error, float wallOffset, int angle) {
+  static unsigned long lastPrintMs = 0;
+  unsigned long now = millis();
+  if (now - lastPrintMs < 200) return;
+  lastPrintMs = now;
+
+  const char *dir = (angle == SERVO_CENTER) ? "STRAIGHT"
+                  : (((SERVO_RIGHT > SERVO_LEFT) == (angle > SERVO_CENTER)) ? "RIGHT" : "LEFT");
+  Serial.print(F("Steer: ")); Serial.print(dir);
+  Serial.print(F("  (heading err: ")); Serial.print(error, 1);
+  Serial.print(F(" deg, wall offset: ")); Serial.print(wallOffset, 1);
+  Serial.print(F(" deg, trim: ")); Serial.print(servoTrim, 1);
+  Serial.println(F(")"));
+}
+
+// Proportional servo steering: yaw error -> servo angle, no deadband needed
+// since the servo holds an exact position instead of bang-bang steering.
+// wallOffset shifts the target heading slightly to keep us between walls
+// (callers pass the global centerOffset, or 0 during turns).
+void steerToHeading(float wallOffset) {
+  float error = (targetYaw + wallOffset) - yaw;   // +error = need to turn CCW (left)
+
+  // learn the standing steering bias, but only while roughly on-heading
+  // (integrating during a 90-deg turn would wind the trim way up)
+  static unsigned long lastTrimMicros = 0;
+  unsigned long nowUs = micros();
+  float dt = (nowUs - lastTrimMicros) / 1000000.0;
+  lastTrimMicros = nowUs;
+  if (dt < 0.5 && fabs(error) < 20.0) {   // dt guard: skip after long gaps (reverse phases etc.)
+    servoTrim = constrain(servoTrim + TRIM_RATE * error * dt, -TRIM_LIMIT, TRIM_LIMIT);
+  }
+
+  // positive error = need to steer LEFT. Which numeric direction that is on
+  // this car's linkage is derived from the calibration constants, so the
+  // polarity can never contradict them (a flipped sign here = positive
+  // feedback = the heading hold runs away and spirals into a wall).
+  int towardLeft = (SERVO_LEFT > SERVO_RIGHT) ? +1 : -1;
+  int angle = SERVO_CENTER + towardLeft * (int)(error * SERVO_KP + servoTrim);
+  angle = constrain(angle, min(SERVO_LEFT, SERVO_RIGHT), max(SERVO_LEFT, SERVO_RIGHT));
+
+  bool steeringRight = (SERVO_RIGHT > SERVO_LEFT) ? (angle > SERVO_CENTER)
+                                                  : (angle < SERVO_CENTER);
+  digitalWrite(LED_BUILTIN, steeringRight ? HIGH : LOW);  // LED on = steering right
+
+  printSteering(error, wallOffset, angle);
+  steeringServo.write(angle);
+}
+
+// Wall centering offset (deg) from the side ultrasonics. Positive = steer
+// left. Steers toward the middle when both walls are visible, and actively
+// away from a single wall that's dangerously close. Returns 0 when a side is
+// open (corner area) so it never fights the corner logic.
+float wallCenteringOffset(long left, long right) {
+  bool leftNear  = left  < WALL_NEAR_CM;
+  bool rightNear = right < WALL_NEAR_CM;
+
+  float offset = 0;
+  if (leftNear && rightNear) {
+    // both walls visible: drift toward the middle (right closer -> positive -> left)
+    offset = WALL_CENTER_GAIN * (float)(left - right) * 0.5;
+  } else if (rightNear && right < WALL_PUSH_CM) {
+    offset = WALL_CENTER_GAIN * (float)(WALL_PUSH_CM - right) * 2.0;   // push LEFT, away from right wall
+  } else if (leftNear && left < WALL_PUSH_CM) {
+    offset = -WALL_CENTER_GAIN * (float)(WALL_PUSH_CM - left) * 2.0;   // push RIGHT, away from left wall
+  }
+  return constrain(offset, -MAX_CENTER_OFFSET, MAX_CENTER_OFFSET);
+}
+
+#if OBSTACLE_MODE
+// Ask the HuskyLens for blocks and keep the closest red/green one (biggest =
+// nearest). Sets the block* globals; blockActive true only if it's close
+// enough (big enough) to steer around.
+void readHuskyBlock() {
+  blockColorId = 0; blockX = 160; blockSize = 0;
+  int best = 0;
+  if (huskylens.request()) {
+    while (huskylens.available()) {
+      HUSKYLENSResult r = huskylens.read();
+      if (r.ID != HUSKY_ID_RED && r.ID != HUSKY_ID_GREEN) continue;
+      int sz = max(r.width, r.height);
+      if (sz > best) { best = sz; blockColorId = r.ID; blockX = r.xCenter; blockSize = sz; }
+    }
+  }
+  blockActive = (blockColorId != 0 && blockSize >= BLOCK_MIN_SIZE);
+}
+
+// Heading offset (deg, positive = steer left) that drives the block's image
+// toward the correct frame edge, so it passes on the rule's side of the car.
+float blockAvoidanceOffset() {
+  bool isRed    = (blockColorId == HUSKY_ID_RED);
+  bool keepLeft = (isRed == (RED_KEEPS_LEFT != 0));   // red keeps left iff RED_KEEPS_LEFT
+  int  xTarget  = keepLeft ? BLOCK_X_LEFT : BLOCK_X_RIGHT;
+  float off = -BLOCK_GAIN * (float)(blockX - xTarget);
+  off = constrain(off, -BLOCK_MAX_OFFSET, BLOCK_MAX_OFFSET);
+
+  // don't let the P-loop ease back to ~0 just because it reached the target
+  // x position - keep committing to the dodge side while the block is active
+  float minOff = keepLeft ? -BLOCK_MIN_OFFSET : BLOCK_MIN_OFFSET;
+  if (keepLeft) off = min(off, minOff);   // more negative = further left commit
+  else          off = max(off, minOff);   // more positive = further right commit
+
+  return off;
+}
+#endif
+
+// =====================================================
+//                       SETUP
+// =====================================================
+void setup() {
+  // grab the hardware reset cause FIRST (brown-out / power-on / external),
+  // before anything else can disturb it
+  uint8_t resetFlags = MCUSR;
+  MCUSR = 0;
+
+  Serial.begin(115200);
+
+  // if a run was in progress when we rebooted, stamp a BOOT marker (with the
+  // reset cause + current Vcc) into its log - this is the brown-out evidence
+  logBootMarker(resetFlags);
+
+  // replay the previous run's flight log (opening the serial monitor resets
+  // the board and lands here; the delay lets the monitor reconnect in time)
+  delay(1000);
+  Serial.print(F("This boot's reset cause: ")); printResetCause(resetFlags); Serial.println();
+  logDump();
+
+  pinMode(IN3, OUTPUT);  pinMode(IN4, OUTPUT);
+  pinMode(ENB, OUTPUT);
+
+  pinMode(FRONT_TRIG, OUTPUT); pinMode(FRONT_ECHO, INPUT);
+  pinMode(RIGHT_TRIG, OUTPUT); pinMode(RIGHT_ECHO, INPUT);
+  pinMode(LEFT_TRIG,  OUTPUT); pinMode(LEFT_ECHO,  INPUT);
+
+  pinMode(START_BUTTON, INPUT_PULLUP);
+  pinMode(LED_BUILTIN, OUTPUT);
+
+  steeringServo.attach(SERVO_PIN);
+  centerSteering();
+  stopDrive();
+
+#if OBSTACLE_MODE
+  Serial2.begin(9600);
+  // the HuskyLens boots slower than the Mega, so one early begin() can miss it -
+  // retry for ~3s before giving up
+  bool huskyOK = false;
+  for (int i = 0; i < 10 && !huskyOK; i++) {
+    huskyOK = huskylens.begin(Serial2);
+    if (!huskyOK) delay(300);
+  }
+  if (!huskyOK)
+    Serial.println(F("HuskyLens NOT found - check 5V power, T->17 R->16, and Serial 9600 mode (NOT I2C)"));
+  else
+    Serial.println(F("HuskyLens ready (expects Color Recognition mode, red+green learned)"));
+#endif
+
+  Serial.println("Calibrating gyro - DO NOT MOVE the vehicle...");
+  gyroInit();
+  Serial.println("Gyro ready. Waiting for start button.");
+}
+
+// =====================================================
+//                        LOOP
+// =====================================================
+void loop() {
+  updateYaw();   // keep heading updated EVERY loop, in every state
+
+#if DEBUG_ALWAYS_READ_US
+  // debug: live readings in every state so the log always moves.
+  // (~450ms per pass -> gyro loop is slow; DO NOT drive/turn like this)
+  #if OBSTACLE_MODE
+  readHuskyBlock();   // so the bench log shows block detection when you wave one in front
+  #endif
+  readUltrasonics(lastFront, lastRight, lastLeft);
+#else
+  // competition: only ping the ultrasonics in states that use them for a
+  // decision (3 samples x 3 sensors = ~100-200ms per pass). Steering keeps
+  // running during the pass via gyroSteerFor; other states just re-print
+  // the last known readings.
+  if (state == STRAIGHT_START || state == FIND_DIRECTION || state == RUN) {
+#if OBSTACLE_MODE
+    readHuskyBlock();
+    if (blockActive) {
+      // a close block steers us (overrides wall centering); remember it so we
+      // can keep clearing it for a moment after the camera loses it up close
+      centerOffset = blockAvoidanceOffset();
+      lastBlockOffset = centerOffset;
+      lastBlockMs = millis();
+    }
+#endif
+    readUltrasonics(lastFront, lastRight, lastLeft);
+#if OBSTACLE_MODE
+    if (!blockActive) {
+  unsigned long sinceBlock = millis() - lastBlockMs;
+  if (sinceBlock < BLOCK_HOLD_MS) {
+    centerOffset = lastBlockOffset;                    // still committed to the dodge line
+  } else if (sinceBlock < BLOCK_HOLD_MS + BLOCK_RETURN_MS) {
+    float t = (float)(sinceBlock - BLOCK_HOLD_MS) / (float)BLOCK_RETURN_MS;  // 0 -> 1
+    centerOffset = lastBlockOffset * (1.0 - t);         // linearly fade the offset back to 0
+  } else {
+    centerOffset = wallCenteringOffset(lastLeft, lastRight);  // back to normal wall following
+  }
+}
+#else
+    centerOffset = wallCenteringOffset(lastLeft, lastRight);
+#endif
+  }
+#endif
+  printUltrasonics(lastFront, lastRight, lastLeft);   // keep logging every loop, in every state
+
+  // flight recorder: capture telemetry to EEPROM while the run is active
+  if (state != WAIT_START && state != DONE) logTelemetry();
+
+  switch (state) {
+
+    // ---------- rule 9.11: wait for the single start button ----------
+    case WAIT_START:
+      #if TESTING_MODE
+        // bench testing only: skip the button, start right after calibration
+        yaw = 0; targetYaw = 0;
+        lastGyroMicros = micros();
+        straightStartMs = millis();
+        logStartRun();                        // fresh log, or continue an interrupted run's log
+        state = STRAIGHT_START;
+        Serial.println("GO (TESTING_MODE - button skipped)");
+      #else
+        if (digitalRead(START_BUTTON) == LOW) {
+          delay(50);                            // debounce
+          yaw = 0; targetYaw = 0;               // this heading = "straight"
+          lastGyroMicros = micros();
+          straightStartMs = millis();
+          logStartRun();                        // fresh log, or continue an interrupted run's log
+          state = STRAIGHT_START;
+          Serial.println("GO");
+        }
+      #endif
+      break;
+
+    // ---------- drive straight for STRAIGHT_START_MS, no corner detection ----------
+    // Gets the car cleanly out of the start section before we start looking
+    // for the first corner (avoids false triggers while still near the start
+    // walls, and gives the gyro heading-hold a clean straight reference run).
+    case STRAIGHT_START:
+      driveForward();
+      steerToHeading(centerOffset);             // gyro hold + wall centering
+
+      if (millis() - straightStartMs >= STRAIGHT_START_MS) {
+        Serial.println(F("Straight-start done -> looking for first corner"));
+        state = FIND_DIRECTION;
+      }
+      break;
+
+    // ---------- drive straight until a side opens up (first corner) ----------
+    case FIND_DIRECTION: {
+      driveForward();
+      steerToHeading(centerOffset);             // gyro hold + wall centering
+
+      // absolute threshold: the corridor is never wider than ~100cm, so a
+      // side past SIDE_OPEN_CM can only be the corner opening
+      bool leftOpened  = lastLeft  >= SIDE_OPEN_CM;
+      bool rightOpened = lastRight >= SIDE_OPEN_CM;
+
+      // a block right ahead reads as a near "front wall" on the ultrasonic -
+      // don't let it fake a corner (the HuskyLens knows it's a block)
+      bool blockAhead = false;
+#if OBSTACLE_MODE
+      blockAhead = blockActive;
+#endif
+
+      // every trigger must hold CORNER_CONFIRM_READS loops in a row (a single
+      // angled-wall no-echo reads as 999 = "open" - don't trust one sample)
+      if (leftOpened || rightOpened)                  sideOpenStreak++;  else sideOpenStreak  = 0;
+      if (lastFront < FRONT_CORNER_CM && !blockAhead) frontCloseStreak++; else frontCloseStreak = 0;
+
+      // remember which side has shown open at any point on this approach, in
+      // case its reading flickers below the threshold right at trigger time.
+      // Only while a front wall is actually coming up - a lone glitch in the
+      // middle of a straight must not be memorized as "the open side".
+      if (lastFront < 150) {
+        if (leftOpened && (!rightOpened || lastLeft >= lastRight)) seenOpenDir = +1;
+        else if (rightOpened)                                      seenOpenDir = -1;
+      }
+
+      bool sideTrigger  = sideOpenStreak   >= CORNER_CONFIRM_READS;
+      bool frontTrigger = frontCloseStreak >= CORNER_CONFIRM_READS;
+
+      if (sideTrigger || frontTrigger) {
+        Serial.print(F("Corner: left ")); Serial.print(lastLeft);
+        Serial.print(F("cm  right ")); Serial.print(lastRight);
+        Serial.print(F("cm  front ")); Serial.print(lastFront); Serial.println(F("cm"));
+
+        // Direction comes from what the sensors say NOW, not from which streak
+        // completed first (flight log: front streak won the race while the
+        // left sensor was reading 138cm of open road - the closer-side
+        // fallback then sent us the wrong way).
+        if (leftOpened || rightOpened) {
+          // a side is open: that's the road. If somehow both, take the wider one.
+          if (leftOpened && (!rightOpened || lastLeft >= lastRight)) {
+            turnDirection = +1;                 // CCW, left turns
+            Serial.println(F("Direction: COUNTER-CLOCKWISE (left open)"));
+          } else {
+            turnDirection = -1;                 // CW, right turns
+            Serial.println(F("Direction: CLOCKWISE (right open)"));
+          }
+        } else if (seenOpenDir != 0) {
+          // no side open right now, but one showed open earlier on this
+          // approach - trust that over the closer-side guess
+          turnDirection = seenOpenDir;
+          Serial.print(F("Direction: side opened earlier on approach -> "));
+          Serial.println(seenOpenDir > 0 ? F("COUNTER-CLOCKWISE") : F("CLOCKWISE"));
+        } else {
+          // neither side ever opened (narrow section, front cue only): the
+          // ring always bends toward its CENTER = toward the inner wall =
+          // the side that reads CLOSER.
+          turnDirection = (lastLeft <= lastRight) ? +1 : -1;
+          Serial.println(F("Direction: front cue - turning toward the closer (inner) side"));
+        }
+        targetYaw += 90.0 * turnDirection;
+        cornerCount = 1;
+        sideOpenStreak = 0; frontCloseStreak = 0;
+        sideRearmed = false;                    // must see the side closed before the next corner counts
+        turnStartMs = millis(); reverseUntilMs = 0;
+        centerOffset = 0;                       // no wall centering mid-turn
+        state = TURNING;
+      }
+      break;
+    }
+
+    // ---------- normal straight driving between corners ----------
+    case RUN: {
+      driveForward();
+      steerToHeading(centerOffset);             // gyro hold + wall centering
+
+      // two corner cues, both confirmed over CORNER_CONFIRM_READS loops and
+      // gated by the post-turn cooldown:
+      //  - the side we turn toward (inner wall) reads open, or
+      //  - the front wall is close (narrow sections, where the side cue is late)
+      long sideNow = (turnDirection == +1) ? lastLeft : lastRight;
+      bool cooldownOver = (millis() - lastTurnDoneMs) >= CORNER_COOLDOWN_MS;
+
+      // a block right ahead reads as a near "front wall" - don't let it fake a corner
+      bool blockAhead = false;
+#if OBSTACLE_MODE
+      blockAhead = blockActive;
+#endif
+
+      // re-arm: the watched side must be seen CLOSED (new section's inner wall
+      // beside us) before its opening can count as the NEXT corner
+      if (sideNow < SIDE_OPEN_CM) sideRearmed = true;
+
+      if (sideNow >= SIDE_OPEN_CM && cooldownOver && sideRearmed)     sideOpenStreak++;  else sideOpenStreak  = 0;
+      if (lastFront < FRONT_CORNER_CM && cooldownOver && !blockAhead) frontCloseStreak++; else frontCloseStreak = 0;
+
+      if (sideOpenStreak >= CORNER_CONFIRM_READS || frontCloseStreak >= CORNER_CONFIRM_READS) {
+        cornerCount++;
+        Serial.print(F("Corner ")); Serial.print(cornerCount);
+        Serial.print((sideOpenStreak >= CORNER_CONFIRM_READS) ? F(" (side opened)") : F(" (front wall)"));
+        Serial.print(F("  side ")); Serial.print(sideNow); Serial.print(F("cm  front "));
+        Serial.print(lastFront); Serial.println(F("cm"));
+        targetYaw += 90.0 * turnDirection;
+        sideOpenStreak = 0; frontCloseStreak = 0;
+        sideRearmed = false;                    // must see the side closed before the next corner counts
+        turnStartMs = millis(); reverseUntilMs = 0;
+        centerOffset = 0;                       // no wall centering mid-turn
+        state = TURNING;
+      }
+      break;
+    }
+
+    // ---------- executing a 90-degree corner ----------
+    case TURNING: {
+      unsigned long now = millis();
+
+      if (now < reverseUntilMs) {
+        // nose was pinned against a wall: back straight up to make room
+        centerSteering();
+        driveBackward();
+      } else if (now - turnStartMs > TURN_TIMEOUT_MS) {
+        // yaw hasn't reached the target in time = we're pushing a wall,
+        // not turning. Reverse for a moment, then resume the turn.
+        Serial.println(F("TURNING stuck - reversing to free the nose"));
+        reverseUntilMs = now + TURN_REVERSE_MS;
+        turnStartMs    = now + TURN_REVERSE_MS;  // restart the timeout after backing up
+      } else {
+        driveForward();
+        steerToHeading(0);                      // no wall centering mid-turn
+      }
+
+      float error = targetYaw - yaw;
+      if (abs(error) < TURN_DONE_ERROR) {
+        lastTurnDoneMs = millis();              // start the corner cooldown
+        if (cornerCount >= TOTAL_CORNERS) {
+          state = FINISH;                       // last corner done -> enter finish
+        } else {
+          state = RUN;
+        }
+      }
+      break;
+    }
+
+    // ---------- 3 laps done: drive to the middle of the start section, stop ----------
+    // Distance-based: entering the section, the far wall is ~2-2.5m ahead;
+    // front < FINISH_FRONT_CM (2 reads in a row) = mid-section. The timeout is
+    // only a backstop (sensor failure / pinned against a wall).
+    case FINISH: {
+      unsigned long t0 = millis();
+      int frontNearStreak = 0;
+      while (millis() - t0 < FINISH_TIMEOUT_MS) {
+        updateYaw();
+        readUltrasonics(lastFront, lastRight, lastLeft);   // update globals so the log stays live
+        printUltrasonics(lastFront, lastRight, lastLeft);
+        logTelemetry();
+
+        if (lastFront < FINISH_FRONT_CM) frontNearStreak++; else frontNearStreak = 0;
+        if (frontNearStreak >= CORNER_CONFIRM_READS) break;   // mid-section reached
+
+        centerOffset = wallCenteringOffset(lastLeft, lastRight);
+        driveForward();
+        steerToHeading(centerOffset);           // gyro hold + wall centering
+      }
+      stopDrive();
+      centerSteering();
+      logRunFinished();                       // run completed normally - next GO starts a fresh log
+      Serial.println("FINISHED - 3 laps");
+      state = DONE;
+      break;
+    }
+
+    // ---------- stay stopped (rule: no movement after the stop) ----------
+    case DONE:
+      stopDrive();
+      centerSteering();
+      break;
+  }
+}
