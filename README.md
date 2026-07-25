@@ -42,6 +42,6 @@ Husky Lens
 
 7. Testing The Robot
     From the beginning of the report and you've been hearing about how perfect the robot is and all this pefection is because we learned from our mistakes during the first test drive which was a catastrophy, the mistakes which ruined the robot weren't only fixed but perfected down to the last detail, and while fixing these flaws many more test drives were taken in between to make sure everything was 100% fixed. A test drive was done around 20 mins ago to test the robots abilities and it showed great results finishing the laps in 33 seconds, round one's code will be provided as a seperate file on this repo
-Note: the youtube link is going to be here at ( https://youtu.be/2A922G6HmCQ?si=gGtHmeCh49PscHyi )
+Note: the youtube link is going to be here at ( https://youtu.be/2A922G6HmCQ?si=gGtHmeCh49PscHyi ) the first successful test drive was timed at 40 sec this showed us that improvement was needed,after upgrading the robot the second test drive showed great improvement and measured at 32 sec, but we weren't satisfied yet, upon upgrading the robot one more time it measured at 28 seconds which is the best time we've recorded this year
 
 
