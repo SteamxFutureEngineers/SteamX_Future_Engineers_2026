@@ -19,7 +19,7 @@ Even after going through the war and not being able to be present at "SteamX Rob
    This task was handled by one person to research every part that's needed for the robot such as the battery, microcontroller, AI lense, motors, etc... that comply with the specifications needed. Some parts weren't available like some certain Lego pieces for the steering mechanism so the team 3D printed these parts (the part's STL files are included in the repo) . Some of the parts include:
    Motors:
 Lego technic large motor (driving)
-Lego technic servo (steering)
+MG90S servo (steering)
 
 Drivers:
 L298n dual motor driver
@@ -28,11 +28,17 @@ Batteries:
 3x 18650 3.7v 2200mah
 
 Sensors:
-HW-290 Gyro sensor
+BNO055 Gyro sensor
 (3x) HC-SR04
 
 Camera:
-Husky Lens
+Raspberry pi cam 8 MP
+
+Microcontroller:
+Arduino MEGA
+
+Main controller:
+Raspberry Pi 5 (8 GB RAM)
 
 5. Assembling The Robot
    This task was handled by two people to ensure precision during the assembly process, making the robot free from error and professionally assembled reducing the risk factor during the competition, but even though the robot was assembled perfectly emergency measures were taken in case of any problem that might occur or for any modification that might be implemented last minute thus making the robot highly customizable.
