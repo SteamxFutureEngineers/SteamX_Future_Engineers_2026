@@ -1,479 +1,1174 @@
 #include <Wire.h>
 #include <Servo.h>
 #include "DFRobot_BNO055.h"
-#include <Ultrasonic.h>
+
+// =====================================================
+// BNO055
+// =====================================================
 
 typedef DFRobot_BNO055_IIC BNO;
 BNO bno(&Wire, 0x28);
 
+
+// =====================================================
+// SERVO
+// =====================================================
+
 Servo steering;
 
-#define IN1 5
-#define IN2 6
+const byte SERVO_PIN = 11;
 
-Ultrasonic ultrasonicR(8, 7);
-Ultrasonic ultrasonicF(3, 2);
-Ultrasonic ultrasonicL(10, 9);
+// These WILL need final mechanical calibration
+const int SERVO_CENTER = 90;
+
+const int SERVO_LEFT_MAX  = 45;
+const int SERVO_RIGHT_MAX = 125;
+
+// Limit used during normal straight driving
+const int SERVO_LEFT_STRAIGHT  = 62;
+const int SERVO_RIGHT_STRAIGHT = 118;
 
 
-// ================================
+// =====================================================
+// MOTOR
+// =====================================================
+
+const byte IN1 = 5;
+const byte IN2 = 6;
+
+const int STRAIGHT_SPEED = 150;
+const int TURN_SPEED     = 150;
+const int FINISH_SPEED   = 140;
+
+
+// =====================================================
+// ULTRASONIC PINS
+// =====================================================
+
+// Front
+const byte TRIG_F = 3;
+const byte ECHO_F = 2;
+
+// Right
+const byte TRIG_R = 8;
+const byte ECHO_R = 7;
+
+// Left
+const byte TRIG_L = 10;
+const byte ECHO_L = 9;
+
+
+// =====================================================
+// START BUTTON
+// =====================================================
+
+const byte START_BUTTON = 12;
+
+
+// =====================================================
 // STATES
-// ================================
-byte start = 0;
-byte turnR = 1;
-byte turnL = 2;
-byte CW = 3;
-byte CCW = 4;
-byte finish = 5;
+// =====================================================
 
-byte count = 0;
-byte state = start;
+enum RobotState
+{
+  WAITING,
+  STRAIGHT,
+  TURNING,
+  FINISHING,
+  STOPPED,
+  ERROR_STOP
+};
 
-
-// ================================
-// PID CONSTANTS
-// ================================
-float Kp = 2.5;
-float Ki = 0.000000011;
-float Kd = 1.0;
+RobotState state = WAITING;
 
 
-// ================================
-// PID VARIABLES
-// ================================
-float error = 0;
-float lastError = 0;
-float integral = 0;
-float derivative = 0;
+// =====================================================
+// TURN DIRECTION
+// =====================================================
+
+enum TurnDirection
+{
+  UNKNOWN,
+  LEFT,
+  RIGHT
+};
+
+TurnDirection routeDirection = UNKNOWN;
 
 
-// ================================
-// HEADING VARIABLES
-// ================================
-float startHeading;
-float targetHeading;
+// =====================================================
+// HEADING
+// =====================================================
 
-// Accumulated heading target
-float turnTarget;
+float initialHeading = 0;
+float targetHeading = 0;
 
 
-// ================================
-// ANGLE DIFFERENCE
-// ================================
-float angleDiff(float target, float current) {
+// =====================================================
+// CORNER / LAP VARIABLES
+// =====================================================
 
-  float diff = target - current;
+byte cornerCount = 0;
 
-  while (diff > 180)
-    diff -= 360;
+const byte TOTAL_CORNERS = 12;
 
-  while (diff < -180)
-    diff += 360;
+unsigned long lastCornerFinished = 0;
+unsigned long turnStartTime = 0;
 
-  return diff;
+
+// Prevent immediate re-detection after a turn
+const unsigned long CORNER_COOLDOWN = 650;
+
+
+// =====================================================
+// FINISH VARIABLES
+// =====================================================
+
+unsigned long finishingStartTime = 0;
+
+bool finishWallsFound = false;
+unsigned long finishWallsFoundTime = 0;
+
+// Robot must move far enough out of final corner
+const unsigned long FINISH_EXTRA_DRIVE = 450;
+
+// Emergency maximum
+const unsigned long FINISH_TIMEOUT = 2200;
+
+
+// =====================================================
+// ULTRASONIC VALUES
+// =====================================================
+
+float distF = 200;
+float distL = 200;
+float distR = 200;
+
+float filteredL = 200;
+float filteredR = 200;
+float filteredF = 200;
+
+
+// =====================================================
+// SENSOR SETTINGS
+// =====================================================
+
+// Higher than any normal side-wall distance.
+//
+// Official corridor maximum is roughly 100 cm,
+// so 125 cm represents "wall disappeared".
+const float OPEN_DISTANCE = 125.0;
+
+// Ignore stupid values
+const float MAX_DISTANCE = 220.0;
+
+// Front emergency protection
+const float FRONT_DANGER = 28.0;
+
+
+// =====================================================
+// OPENING DEBOUNCE
+// =====================================================
+
+byte leftOpenCounter  = 0;
+byte rightOpenCounter = 0;
+
+const byte OPEN_CONFIRMATIONS = 2;
+
+
+// =====================================================
+// STRAIGHT CONTROL
+// =====================================================
+
+// Heading correction
+float HEADING_KP = 1.50;
+float HEADING_KD = 0.08;
+
+// Wall centering correction
+float WALL_KP = 0.45;
+
+float previousHeadingError = 0;
+
+unsigned long lastControlTime = 0;
+
+
+// =====================================================
+// TURN SETTINGS
+// =====================================================
+
+const float TURN_ANGLE = 90.0;
+
+const float TURN_TOLERANCE = 4.0;
+
+const unsigned long TURN_TIMEOUT = 3000;
+
+
+// =====================================================
+// DEBUG
+// =====================================================
+
+#define DEBUG_ROBOT 1
+
+
+// =====================================================
+// ANGLE NORMALIZATION
+// =====================================================
+
+float angleDiff(float target, float current)
+{
+  float difference = target - current;
+
+  while (difference > 180.0)
+    difference -= 360.0;
+
+  while (difference < -180.0)
+    difference += 360.0;
+
+  return difference;
 }
 
 
-// ================================
-// STOP MOTOR
-// ================================
-void stopMotor() {
+// =====================================================
+// NORMALIZE HEADING
+// =====================================================
 
+float normalizeHeading(float angle)
+{
+  while (angle >= 360.0)
+    angle -= 360.0;
+
+  while (angle < 0.0)
+    angle += 360.0;
+
+  return angle;
+}
+
+
+// =====================================================
+// GET BNO HEADING
+// =====================================================
+
+float getHeading()
+{
+  BNO::sEulAnalog_t euler = bno.getEul();
+
+  return normalizeHeading(euler.head);
+}
+
+
+// =====================================================
+// MOTOR
+// =====================================================
+
+void setMotorSpeed(int motorSpeed)
+{
+  motorSpeed = constrain(motorSpeed, 0, 255);
+
+  analogWrite(IN1, motorSpeed);
+  digitalWrite(IN2, LOW);
+}
+
+
+void stopMotor()
+{
   digitalWrite(IN1, LOW);
   digitalWrite(IN2, LOW);
 }
 
 
-// ================================
-// FORWARD MOTOR
-// ================================
-void forwardMotor() {
+// =====================================================
+// ULTRASONIC READ
+// =====================================================
 
-  analogWrite(IN1, 200);
-  digitalWrite(IN2, LOW);
+float readUltrasonicCM(byte trigPin, byte echoPin)
+{
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(3);
+
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+
+  digitalWrite(trigPin, LOW);
+
+
+  // 15000 us gives roughly 2.5 m maximum.
+  unsigned long duration =
+    pulseIn(echoPin, HIGH, 15000UL);
+
+
+  // No echo
+  if (duration == 0)
+  {
+    return MAX_DISTANCE;
+  }
+
+
+  float distance = duration * 0.0343 / 2.0;
+
+
+  if (distance > MAX_DISTANCE)
+    distance = MAX_DISTANCE;
+
+  if (distance < 2)
+    distance = 2;
+
+
+  return distance;
 }
 
 
-// ================================
-// DRIVE FORWARD WITH PID
-// ================================
-void driveForward() {
+// =====================================================
+// READ ALL ULTRASONICS
+// =====================================================
 
-  forwardMotor();
+void updateDistances()
+{
+  // Don't fire all three at exactly the same time.
+  // This reduces ultrasonic cross-talk.
 
-  BNO::sEulAnalog_t euler = bno.getEul();
+  distF = readUltrasonicCM(TRIG_F, ECHO_F);
 
-  float heading = euler.head;
+  delay(3);
 
-  // Compare actual heading with accumulated target
-  error = angleDiff(targetHeading, heading);
+  distR = readUltrasonicCM(TRIG_R, ECHO_R);
 
-  integral += error;
+  delay(3);
 
-  derivative = error - lastError;
+  distL = readUltrasonicCM(TRIG_L, ECHO_L);
 
-  float pid =
-    (Kp * error) +
-    (Ki * integral) +
-    (Kd * derivative);
 
-  lastError = error;
+  // -------------------------------------------------
+  // Low-pass filtering
+  // -------------------------------------------------
 
-  int servoAngle = constrain(90 + pid, 60, 120);
+  const float alpha = 0.35;
+
+  filteredF =
+    (alpha * distF) +
+    ((1.0 - alpha) * filteredF);
+
+  filteredR =
+    (alpha * distR) +
+    ((1.0 - alpha) * filteredR);
+
+  filteredL =
+    (alpha * distL) +
+    ((1.0 - alpha) * filteredL);
+}
+
+
+// =====================================================
+// WALL VALIDITY
+// =====================================================
+
+bool leftWallPresent()
+{
+  return distL < OPEN_DISTANCE;
+}
+
+
+bool rightWallPresent()
+{
+  return distR < OPEN_DISTANCE;
+}
+
+
+bool bothWallsPresent()
+{
+  return leftWallPresent() &&
+         rightWallPresent();
+}
+
+
+// =====================================================
+// RESET STRAIGHT CONTROLLER
+// =====================================================
+
+void resetStraightController()
+{
+  previousHeadingError = 0;
+
+  lastControlTime = millis();
+}
+
+
+// =====================================================
+// DRIVE STRAIGHT
+// =====================================================
+
+void driveStraight(int motorSpeed)
+{
+  float heading = getHeading();
+
+
+  // -------------------------------------------------
+  // DT
+  // -------------------------------------------------
+
+  unsigned long now = millis();
+
+  float dt =
+    (now - lastControlTime) / 1000.0;
+
+  lastControlTime = now;
+
+
+  if (dt <= 0 || dt > 0.2)
+    dt = 0.02;
+
+
+  // -------------------------------------------------
+  // HEADING ERROR
+  // -------------------------------------------------
+
+  float headingError =
+    angleDiff(
+      targetHeading,
+      heading
+    );
+
+
+  float derivative =
+    (headingError - previousHeadingError)
+    / dt;
+
+  previousHeadingError = headingError;
+
+
+  // -------------------------------------------------
+  // WALL CENTERING
+  // -------------------------------------------------
+
+  float wallError = 0;
+
+
+  // Only use wall centering when BOTH walls actually
+  // exist.
+  //
+  // This is critical at corners because the inside
+  // ultrasonic suddenly sees empty space.
+
+  if (bothWallsPresent())
+  {
+    // Example:
+    //
+    // closer to right wall:
+    //
+    // right = 10
+    // left  = 30
+    //
+    // 10 - 30 = -20
+    //
+    // negative steering correction -> LEFT
+    //
+    // exactly what we want.
+
+    wallError =
+      filteredR - filteredL;
+  }
+
+
+  // -------------------------------------------------
+  // CONTROLLER
+  // -------------------------------------------------
+
+  float correction =
+      HEADING_KP * headingError
+    + HEADING_KD * derivative
+    + WALL_KP    * wallError;
+
+
+  int servoAngle =
+    SERVO_CENTER + correction;
+
+
+  servoAngle =
+    constrain(
+      servoAngle,
+      SERVO_LEFT_STRAIGHT,
+      SERVO_RIGHT_STRAIGHT
+    );
+
 
   steering.write(servoAngle);
 
-  delay(10);
+  setMotorSpeed(motorSpeed);
 }
 
 
-// ================================
-// TURN LEFT 90 DEGREES
-// ================================
-void turnLeft90() {
+// =====================================================
+// CHECK CORNER OPENING
+// =====================================================
 
-  // =================================
-  // ACCUMULATE LEFT TURN
-  // =================================
-  turnTarget -= 90;
-
-  // Keep between 0 and 360
-  if (turnTarget < 0)
-    turnTarget += 360;
-
-  targetHeading = turnTarget;
-
-
-  steering.write(45);
-  forwardMotor();
-
-  unsigned long turnStart = millis();
-
-  while (true) {
-
-    BNO::sEulAnalog_t euler = bno.getEul();
-
-    float heading = euler.head;
-
-    float turnError = angleDiff(targetHeading, heading);
+bool detectRightOpening()
+{
+  if (distR > OPEN_DISTANCE)
+  {
+    if (rightOpenCounter < 10)
+      rightOpenCounter++;
+  }
+  else
+  {
+    rightOpenCounter = 0;
+  }
 
 
-    // ================================
-    // TURN COMPLETE
-    // ================================
-    if (abs(turnError) <= 5.0) {
+  return
+    rightOpenCounter >=
+    OPEN_CONFIRMATIONS;
+}
 
-      stopMotor();
-      steering.write(90);
 
-      // DO NOT change targetHeading here
+bool detectLeftOpening()
+{
+  if (distL > OPEN_DISTANCE)
+  {
+    if (leftOpenCounter < 10)
+      leftOpenCounter++;
+  }
+  else
+  {
+    leftOpenCounter = 0;
+  }
 
-      lastError = 0;
-      integral = 0;
-      derivative = 0;
 
-      delay(300);
+  return
+    leftOpenCounter >=
+    OPEN_CONFIRMATIONS;
+}
 
-      return;
+
+// =====================================================
+// START TURN
+// =====================================================
+
+void startTurn(TurnDirection direction)
+{
+  if (direction == RIGHT)
+  {
+    targetHeading =
+      normalizeHeading(
+        targetHeading + TURN_ANGLE
+      );
+  }
+
+  else if (direction == LEFT)
+  {
+    targetHeading =
+      normalizeHeading(
+        targetHeading - TURN_ANGLE
+      );
+  }
+
+
+  turnStartTime = millis();
+
+  leftOpenCounter  = 0;
+  rightOpenCounter = 0;
+
+  state = TURNING;
+}
+
+
+// =====================================================
+// UPDATE TURN
+// =====================================================
+
+void updateTurn()
+{
+  float heading = getHeading();
+
+  float error =
+    angleDiff(
+      targetHeading,
+      heading
+    );
+
+
+  float remaining =
+    abs(error);
+
+
+  // -------------------------------------------------
+  // TURN COMPLETE
+  // -------------------------------------------------
+
+  if (remaining <= TURN_TOLERANCE)
+  {
+    steering.write(SERVO_CENTER);
+
+    cornerCount++;
+
+    lastCornerFinished = millis();
+
+    resetStraightController();
+
+
+#if DEBUG_ROBOT
+
+    Serial.print("Corner completed: ");
+    Serial.println(cornerCount);
+
+#endif
+
+
+    // Three laps = 12 corners
+    if (cornerCount >= TOTAL_CORNERS)
+    {
+      finishingStartTime = millis();
+
+      finishWallsFound = false;
+
+      state = FINISHING;
+    }
+    else
+    {
+      state = STRAIGHT;
     }
 
 
-    // ================================
-    // SAFETY TIMEOUT
-    // ================================
-    if (millis() - turnStart > 3000) {
+    return;
+  }
 
-      stopMotor();
-      steering.write(90);
 
-      // Keep accumulated target
+  // -------------------------------------------------
+  // TURN TIMEOUT
+  // -------------------------------------------------
 
-      lastError = 0;
-      integral = 0;
-      derivative = 0;
+  if (
+    millis() - turnStartTime >
+    TURN_TIMEOUT
+  )
+  {
+    stopMotor();
 
-      delay(300);
+    steering.write(SERVO_CENTER);
 
-      return;
+    state = ERROR_STOP;
+
+    return;
+  }
+
+
+  // -------------------------------------------------
+  // PROGRESSIVE STEERING
+  // -------------------------------------------------
+
+  int servoAngle;
+
+
+  if (routeDirection == RIGHT)
+  {
+    // Strong steering early in turn
+    if (remaining > 35)
+    {
+      servoAngle =
+        SERVO_RIGHT_MAX;
     }
 
-    delay(100);
+    // Reduce steering near target to reduce overshoot
+    else if (remaining > 15)
+    {
+      servoAngle =
+        (SERVO_RIGHT_MAX +
+         SERVO_CENTER) / 2;
+    }
+
+    else
+    {
+      servoAngle =
+        SERVO_CENTER + 12;
+    }
+  }
+
+  else
+  {
+    if (remaining > 35)
+    {
+      servoAngle =
+        SERVO_LEFT_MAX;
+    }
+
+    else if (remaining > 15)
+    {
+      servoAngle =
+        (SERVO_LEFT_MAX +
+         SERVO_CENTER) / 2;
+    }
+
+    else
+    {
+      servoAngle =
+        SERVO_CENTER - 12;
+    }
+  }
+
+
+  steering.write(servoAngle);
+
+  setMotorSpeed(TURN_SPEED);
+}
+
+
+// =====================================================
+// FINISH THREE LAPS
+// =====================================================
+
+void updateFinishing()
+{
+  driveStraight(FINISH_SPEED);
+
+
+  unsigned long now = millis();
+
+
+  // -------------------------------------------------
+  // Find normal straight corridor again
+  // -------------------------------------------------
+
+  if (bothWallsPresent())
+  {
+    if (!finishWallsFound)
+    {
+      finishWallsFound = true;
+
+      finishWallsFoundTime = now;
+    }
+  }
+
+
+  // Once both walls are clearly visible again,
+  // continue a little farther so the entire 25 cm
+  // vehicle is completely inside the straight section.
+
+  if (
+    finishWallsFound &&
+    now - finishWallsFoundTime >=
+    FINISH_EXTRA_DRIVE
+  )
+  {
+    stopMotor();
+
+    steering.write(SERVO_CENTER);
+
+    state = STOPPED;
+
+    return;
+  }
+
+
+  // Emergency fallback.
+  //
+  // We do NOT want the car accidentally entering
+  // corner 13.
+
+  if (
+    now - finishingStartTime >
+    FINISH_TIMEOUT
+  )
+  {
+    stopMotor();
+
+    steering.write(SERVO_CENTER);
+
+    state = STOPPED;
   }
 }
 
 
-// ================================
-// TURN RIGHT 90 DEGREES
-// ================================
-void turnRight90() {
-
-  // =================================
-  // ACCUMULATE RIGHT TURN
-  // =================================
-  turnTarget += 90;
-
-  // Keep between 0 and 360
-  if (turnTarget >= 360)
-    turnTarget -= 360;
-
-  targetHeading = turnTarget;
-
-
-  steering.write(125);
-  forwardMotor();
-
-  unsigned long turnStart = millis();
-
-  while (true) {
-
-    BNO::sEulAnalog_t euler = bno.getEul();
-
-    float heading = euler.head;
-
-    float turnError = angleDiff(targetHeading, heading);
-
-
-    // ================================
-    // TURN COMPLETE
-    // ================================
-    if (abs(turnError) <= 5.0) {
-
-      stopMotor();
-      steering.write(90);
-
-      // DO NOT reset targetHeading
-
-      lastError = 0;
-      integral = 0;
-      derivative = 0;
-
-      delay(300);
-
-      return;
-    }
-
-
-    // ================================
-    // SAFETY TIMEOUT
-    // ================================
-    if (millis() - turnStart > 3000) {
-
-      stopMotor();
-      steering.write(90);
-
-      // Keep accumulated target
-
-      lastError = 0;
-      integral = 0;
-      derivative = 0;
-
-      delay(300);
-
-      return;
-    }
-
-    delay(10);
-  }
-}
-
-
-// ================================
+// =====================================================
 // SETUP
-// ================================
-void setup() {
+// =====================================================
+
+void setup()
+{
+  Serial.begin(115200);
+
+
+  // -------------------------------------------------
+  // Motor
+  // -------------------------------------------------
 
   pinMode(IN1, OUTPUT);
   pinMode(IN2, OUTPUT);
 
-  steering.attach(11);
-  steering.write(90);
+  stopMotor();
+
+
+  // -------------------------------------------------
+  // Ultrasonics
+  // -------------------------------------------------
+
+  pinMode(TRIG_F, OUTPUT);
+  pinMode(ECHO_F, INPUT);
+
+  pinMode(TRIG_R, OUTPUT);
+  pinMode(ECHO_R, INPUT);
+
+  pinMode(TRIG_L, OUTPUT);
+  pinMode(ECHO_L, INPUT);
+
+
+  // -------------------------------------------------
+  // Start button
+  // -------------------------------------------------
+
+  pinMode(
+    START_BUTTON,
+    INPUT_PULLUP
+  );
+
+
+  // -------------------------------------------------
+  // Servo
+  // -------------------------------------------------
+
+  steering.attach(SERVO_PIN);
+
+  steering.write(SERVO_CENTER);
+
+
+  // -------------------------------------------------
+  // BNO055
+  // -------------------------------------------------
 
   Wire.begin();
 
   bno.reset();
 
-  while (bno.begin() != BNO::eStatusOK) {
-    // Wait for BNO055
+
+  while (
+    bno.begin() !=
+    BNO::eStatusOK
+  )
+  {
+#if DEBUG_ROBOT
+    Serial.println(
+      "BNO055 not detected"
+    );
+#endif
+
+    delay(500);
   }
 
 
-  // ================================
-  // GET INITIAL HEADING
-  // ================================
-  BNO::sEulAnalog_t euler = bno.getEul();
+  delay(1000);
 
-  startHeading = euler.head;
 
-  // Initial forward direction
-  targetHeading = startHeading;
+  // Prime ultrasonic filters
 
-  // Start accumulated target
-  turnTarget = startHeading;
+  updateDistances();
+
+  filteredF = distF;
+  filteredL = distL;
+  filteredR = distR;
+
+
+#if DEBUG_ROBOT
+
+  Serial.println(
+    "Robot ready. Press START."
+  );
+
+#endif
 }
 
 
-// ================================
-// MOVE AFTER TURN
-// ================================
-void moveAfterTurn() {
-
-  steering.write(90);
-
-  // Move forward a little
-  // without changing heading target
-  forwardMotor();
-
-  delay(200);
-
-  stopMotor();
-
-  delay(10);
-
-  // Keep accumulated targetHeading
-  lastError = 0;
-  integral = 0;
-  derivative = 0;
-}
-
-
-unsigned long startTime = 0;
-
-
-// ================================
+// =====================================================
 // LOOP
-// ================================
-void loop() {
+// =====================================================
+
+void loop()
+{
+  updateDistances();
 
 
-  // =========================
-  // START / DRIVE FORWARD
-  // =========================
-  if (state == start) {
+  // =================================================
+  // WAITING
+  // =================================================
 
-    driveForward();
-
-    int rightDistance = ultrasonicR.read();
-    int leftDistance = ultrasonicL.read();
-
-
-    // =========================
-    // RIGHT DETECTION
-    // =========================
-    if (rightDistance > 130) {
-
-      state = turnR;
-    }
-
-
-    // =========================
-    // LEFT DETECTION
-    // =========================
-    if (leftDistance > 130) {
-
-      state = turnL;
-    }
-  }
-
-
-  // =========================
-  // RIGHT TURN
-  // =========================
-  if (state == turnR) {
-
-    turnRight90();
-
-    count++;
-
-    moveAfterTurn();
-
-    state = CW;
-
-    return;
-  }
-
-
-  // =========================
-  // CLOCKWISE
-  // =========================
-  if (state == CW) {
-
-    if (count >= 12) {
-
-      startTime = millis();
-
-      state = finish;
-
-      return;
-    }
-
-    driveForward();
-
-    int rightDistance = ultrasonicR.read();
-
-    if (rightDistance > 130) {
-
-      state = turnR;
-    }
-  }
-
-
-  // =========================
-  // LEFT TURN
-  // =========================
-  if (state == turnL) {
-
-    turnLeft90();
-
-    count++;
-
-    moveAfterTurn();
-
-    state = CCW;
-
-    return;
-  }
-
-
-  // =========================
-  // COUNTER-CLOCKWISE
-  // =========================
-  if (state == CCW) {
-
-    if (count >= 12) {
-
-      startTime = millis();
-
-      state = finish;
-
-      return;
-    }
-
-    driveForward();
-
-    int leftDistance = ultrasonicL.read();
-
-    if (leftDistance > 130) {
-
-      state = turnL;
-    }
-  }
-
-
-  // =========================
-  // FINISH
-  // =========================
-  if (state == finish) {
-
-    while (millis() - startTime < 2000) {
-
-      driveForward();
-    }
-
+  if (state == WAITING)
+  {
     stopMotor();
 
-    steering.write(90);
+    steering.write(SERVO_CENTER);
 
-    while (true) {
+
+    if (
+      digitalRead(START_BUTTON) ==
+      LOW
+    )
+    {
+      delay(40); // debounce
+
+
+      if (
+        digitalRead(START_BUTTON) ==
+        LOW
+      )
+      {
+        initialHeading =
+          getHeading();
+
+        targetHeading =
+          initialHeading;
+
+
+        cornerCount = 0;
+
+        routeDirection =
+          UNKNOWN;
+
+
+        resetStraightController();
+
+
+        lastCornerFinished =
+          millis();
+
+
+        state = STRAIGHT;
+
+
+#if DEBUG_ROBOT
+
+        Serial.print(
+          "START heading: "
+        );
+
+        Serial.println(
+          initialHeading
+        );
+
+#endif
+
+
+        // Wait for button release
+        while (
+          digitalRead(
+            START_BUTTON
+          ) == LOW
+        )
+        {
+          delay(5);
+        }
+      }
     }
+
+
+    return;
+  }
+
+
+  // =================================================
+  // STRAIGHT
+  // =================================================
+
+  if (state == STRAIGHT)
+  {
+    driveStraight(
+      STRAIGHT_SPEED
+    );
+
+
+    // Do not detect another corner immediately after
+    // completing a turn.
+
+    if (
+      millis() -
+      lastCornerFinished <
+      CORNER_COOLDOWN
+    )
+    {
+      return;
+    }
+
+
+    // -----------------------------------------------
+    // FIRST CORNER
+    // -----------------------------------------------
+    //
+    // We don't yet know whether this run is CW or CCW.
+    //
+    // The side where the inner wall disappears tells
+    // us the turning direction.
+
+    if (
+      routeDirection ==
+      UNKNOWN
+    )
+    {
+      bool rightOpen =
+        detectRightOpening();
+
+      bool leftOpen =
+        detectLeftOpening();
+
+
+      if (
+        rightOpen &&
+        !leftOpen
+      )
+      {
+        routeDirection =
+          RIGHT;
+
+#if DEBUG_ROBOT
+
+        Serial.println(
+          "ROUTE = RIGHT / CW"
+        );
+
+#endif
+
+        startTurn(RIGHT);
+
+        return;
+      }
+
+
+      if (
+        leftOpen &&
+        !rightOpen
+      )
+      {
+        routeDirection =
+          LEFT;
+
+#if DEBUG_ROBOT
+
+        Serial.println(
+          "ROUTE = LEFT / CCW"
+        );
+
+#endif
+
+        startTurn(LEFT);
+
+        return;
+      }
+    }
+
+
+    // -----------------------------------------------
+    // REMAINING RIGHT TURNS
+    // -----------------------------------------------
+
+    else if (
+      routeDirection ==
+      RIGHT
+    )
+    {
+      if (detectRightOpening())
+      {
+        startTurn(RIGHT);
+
+        return;
+      }
+    }
+
+
+    // -----------------------------------------------
+    // REMAINING LEFT TURNS
+    // -----------------------------------------------
+
+    else if (
+      routeDirection ==
+      LEFT
+    )
+    {
+      if (detectLeftOpening())
+      {
+        startTurn(LEFT);
+
+        return;
+      }
+    }
+
+
+    // -----------------------------------------------
+    // FRONT SAFETY
+    // -----------------------------------------------
+
+    if (filteredF < FRONT_DANGER)
+    {
+      // If the corner opening detector somehow missed
+      // the corner, use the already-known direction.
+
+      if (
+        routeDirection ==
+        RIGHT
+      )
+      {
+        startTurn(RIGHT);
+      }
+
+      else if (
+        routeDirection ==
+        LEFT
+      )
+      {
+        startTurn(LEFT);
+      }
+    }
+
+
+    return;
+  }
+
+
+  // =================================================
+  // TURNING
+  // =================================================
+
+  if (state == TURNING)
+  {
+    updateTurn();
+
+    return;
+  }
+
+
+  // =================================================
+  // FINISHING
+  // =================================================
+
+  if (state == FINISHING)
+  {
+    updateFinishing();
+
+    return;
+  }
+
+
+  // =================================================
+  // STOPPED
+  // =================================================
+
+  if (state == STOPPED)
+  {
+    stopMotor();
+
+    steering.write(
+      SERVO_CENTER
+    );
+
+    return;
+  }
+
+
+  // =================================================
+  // ERROR
+  // =================================================
+
+  if (state == ERROR_STOP)
+  {
+    stopMotor();
+
+    steering.write(
+      SERVO_CENTER
+    );
+
+    return;
   }
 }
